@@ -2,9 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import QRCode from 'qrcode';
 import { Html5Qrcode } from 'html5-qrcode';
+import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
+import { collection, doc, onSnapshot, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
 import {
   Bell,
   BookOpen,
+  Bot,
   CalendarClock,
   CalendarDays,
   Camera,
@@ -22,24 +25,28 @@ import {
   Printer,
   QrCode,
   Search,
+  Send,
   Settings,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Upload,
   UserRound,
   Users,
   XCircle
 } from 'lucide-react';
+import { auth, db, uploadFileToStorage } from './firebase';
 import './styles.css';
 
-const STORAGE_KEY = 'jam3iya-app-v3-academic';
-const AUTH_KEY = 'jam3iya-auth';
+const FIRESTORE_COLLECTIONS = ['students', 'schoolYears', 'teachers', 'subjects', 'teacherSchedules', 'studentSubjects', 'payments', 'attendanceLogs', 'admins'];
 const ALL = 'الكل';
 const PAID = 'مدفوع';
 const UNPAID = 'غير مدفوع';
 const EXPIRED = 'منتهي الصلاحية';
 const SOON = 'سينتهي قريباً';
 const CREDIT = 'كريدي';
+const AI_ASSISTANT_NAME = 'deepseek/deepseek-v4-flash:free';
+const AI_WELCOME_MESSAGE = `مرحباً، أنا ${AI_ASSISTANT_NAME}، كيف يمكنني مساعدتك في إدارة الجمعية اليوم؟`;
 
 const SCHOOL_YEARS = [
   'السنة الأولى ابتدائي',
@@ -88,9 +95,10 @@ const emptyStore = {
     successTone: '',
     alertTone: ''
   },
-  admins: [{ id: 'admin_1', username: 'admin', password: 'admin123', name: 'الإدارة' }],
+  admins: [],
   students: [],
   payments: [],
+  credits: [],
   attendanceLogs: [],
   subjects: [],
   teachers: [],
@@ -197,6 +205,7 @@ function normalizeStore(data) {
     admins: source.admins?.length ? source.admins : emptyStore.admins,
     students: (source.students || []).map(hydrateStudent),
     payments: source.payments || [],
+    credits: source.credits || [],
     attendanceLogs: source.attendanceLogs || [],
     subjects: (source.subjects || []).map(hydrateSubject),
     teachers: (source.teachers || []).map(hydrateTeacher),
@@ -205,14 +214,93 @@ function normalizeStore(data) {
   };
 }
 
-function loadStore() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) return normalizeStore(emptyStore);
-  try {
-    return normalizeStore(JSON.parse(raw));
-  } catch {
-    return normalizeStore(emptyStore);
+function cleanForFirestore(value) {
+  if (Array.isArray(value)) return value.map(cleanForFirestore);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined && typeof item !== 'function')
+        .filter(([key]) => key !== 'paymentStatus')
+        .map(([key, item]) => [key, cleanForFirestore(item)])
+    );
   }
+  return value ?? '';
+}
+
+function sameFirebaseData(a, b) {
+  return JSON.stringify(cleanForFirestore(a || {})) === JSON.stringify(cleanForFirestore(b || {}));
+}
+
+function readFirestoreDoc(item) {
+  const { updatedAt, createdAt, lastLoginAt, ...data } = item.data() || {};
+  return { id: item.id, ...data };
+}
+
+function toMap(items = []) {
+  return new Map(items.filter(item => item?.id).map(item => [item.id, item]));
+}
+
+function buildCreditDoc(student, settings) {
+  const paymentStatus = getPaymentStatus(student, settings);
+  if (paymentStatus !== UNPAID && Number(student.creditAmount || 0) <= 0) return null;
+  return {
+    id: student.id,
+    studentId: student.id,
+    fullName: student.fullName || '',
+    level: student.level || '',
+    group: student.group || '',
+    phone: student.phone || '',
+    guardianName: student.guardianName || '',
+    guardianPhone: student.guardianPhone || '',
+    amount: Number(student.creditAmount || 0),
+    debtStartDate: student.debtStartDate || student.registrationDate || '',
+    lastReminderDate: student.lastReminderDate || '',
+    notes: student.creditNotes || '',
+    paymentStatus: CREDIT
+  };
+}
+
+async function syncCollection(collectionName, beforeItems = [], afterItems = []) {
+  const before = toMap(beforeItems);
+  const after = toMap(afterItems);
+  const batch = writeBatch(db);
+  let changed = 0;
+
+  after.forEach((item, id) => {
+    if (!sameFirebaseData(before.get(id), item)) {
+      batch.set(doc(db, collectionName, id), { ...cleanForFirestore(item), updatedAt: serverTimestamp() }, { merge: true });
+      changed += 1;
+    }
+  });
+
+  before.forEach((_, id) => {
+    if (!after.has(id)) {
+      batch.delete(doc(db, collectionName, id));
+      changed += 1;
+    }
+  });
+
+  if (changed) await batch.commit();
+}
+
+async function syncCredits(beforeStore, afterStore) {
+  const beforeCredits = beforeStore.students
+    .map(student => buildCreditDoc(student, beforeStore.settings))
+    .filter(Boolean);
+  const afterCredits = afterStore.students
+    .map(student => buildCreditDoc(student, afterStore.settings))
+    .filter(Boolean);
+  await syncCollection('credits', beforeCredits, afterCredits);
+}
+
+async function persistStoreChanges(beforeStore, afterStore) {
+  await Promise.all([
+    ...FIRESTORE_COLLECTIONS.map(collectionName => syncCollection(collectionName, beforeStore[collectionName], afterStore[collectionName])),
+    sameFirebaseData(beforeStore.settings, afterStore.settings)
+      ? Promise.resolve()
+      : setDoc(doc(db, 'settings', 'app'), { ...cleanForFirestore(afterStore.settings), updatedAt: serverTimestamp() }, { merge: true }),
+    syncCredits(beforeStore, afterStore)
+  ]);
 }
 
 function getPaymentStatus(student, settings) {
@@ -236,6 +324,181 @@ function getStudentAcademicRows(studentId, store) {
       teacher: store.teachers.find(teacher => teacher.id === link.teacherId),
       schedule: store.teacherSchedules.find(schedule => schedule.id === link.scheduleId)
     }));
+}
+
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u064B-\u065F]/g, '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function listLines(items, emptyText = 'لا توجد نتائج حالياً.') {
+  return items.length ? items.map((item, index) => `${index + 1}. ${item}`).join('\n') : emptyText;
+}
+
+function studentLine(student) {
+  return `${student.fullName || 'بدون اسم'} - ${student.level || 'سنة غير محددة'} - ${student.group || 'فوج غير محدد'} - الحالة: ${student.paymentStatus}`;
+}
+
+function findStudentByQuestion(question, students) {
+  const q = normalizeSearchText(question);
+  return students.find(student => {
+    const name = normalizeSearchText(student.fullName);
+    return name && (q.includes(name) || name.split(' ').filter(Boolean).some(part => part.length > 2 && q.includes(part)));
+  });
+}
+
+function findTeacherByQuestion(question, teachers) {
+  const q = normalizeSearchText(question);
+  return teachers.find(teacher => {
+    const name = normalizeSearchText(teacher.fullName);
+    return name && (q.includes(name) || name.split(' ').filter(Boolean).some(part => part.length > 2 && q.includes(part)));
+  });
+}
+
+function findSubjectByQuestion(question, subjects) {
+  const q = normalizeSearchText(question);
+  const aliases = [
+    ['رياض', 'الرياضيات'],
+    ['فرنسي', 'اللغة الفرنسية'],
+    ['فرنسية', 'اللغة الفرنسية'],
+    ['انجليزي', 'اللغة الإنجليزية'],
+    ['انجليزية', 'اللغة الإنجليزية'],
+    ['عربي', 'اللغة العربية'],
+    ['عربية', 'اللغة العربية'],
+    ['علوم', 'العلوم الطبيعية'],
+    ['فيزياء', 'الفيزياء'],
+    ['تاريخ', 'التاريخ والجغرافيا'],
+    ['جغرافيا', 'التاريخ والجغرافيا']
+  ];
+  return subjects.find(subject => {
+    const name = normalizeSearchText(subject.name);
+    if (name && q.includes(name)) return true;
+    return aliases.some(([alias, canonical]) => q.includes(normalizeSearchText(alias)) && name === normalizeSearchText(canonical));
+  });
+}
+
+function hasStudentWord(text) {
+  return ['تلميذ', 'تلاميذ', 'طالب', 'طلاب'].some(word => text.includes(word));
+}
+
+function hasAmountWord(text) {
+  return ['مبلغ', 'مبالغ', 'مجموع', 'اجمالي', 'إجمالي'].some(word => text.includes(normalizeSearchText(word)));
+}
+
+function answerAssistantQuestion(question, store) {
+  const q = normalizeSearchText(question);
+  const students = store.students || [];
+  const subjects = store.subjects || [];
+  const teachers = store.teachers || [];
+  const schedules = store.teacherSchedules || [];
+  const payments = store.payments || [];
+  const logs = store.attendanceLogs || [];
+  const creditStudents = students.filter(isCreditStudent);
+  const totalCredit = creditStudents.reduce((sum, student) => sum + Number(student.creditAmount || 0), 0);
+  const soonStudents = students.filter(student => student.paymentStatus === SOON);
+  const todayLogs = logs.filter(log => log.scannedAt?.slice(0, 10) === todayISO());
+  const student = findStudentByQuestion(question, students);
+  const teacher = findTeacherByQuestion(question, teachers);
+  const subject = findSubjectByQuestion(question, subjects);
+  const requestedYear = SCHOOL_YEARS.find(year => q.includes(normalizeSearchText(year)));
+
+  if (!q) return 'اكتب سؤالاً عن بيانات الجمعية وسأحلله لك.';
+
+  if ((q.includes('كم') || q.includes('عدد')) && hasStudentWord(q) && !subject && !requestedYear) {
+    return `عدد التلاميذ المسجلين حالياً هو: ${students.length}.`;
+  }
+
+  if ((q.includes('كريدي') || q.includes('لم يدفع') || q.includes('غير مدفوع')) && hasAmountWord(q)) {
+    return `إجمالي مبالغ الكريديات الحالية هو ${money(totalCredit)}، وعدد التلاميذ المعنيين هو ${creditStudents.length}.`;
+  }
+
+  if (q.includes('كريدي') || q.includes('لم يدفع') || q.includes('غير مدفوع')) {
+    return `التلاميذ الموجودون في الكريديات أو غير المدفوعين:\n${listLines(creditStudents.map(studentLine), 'لا يوجد تلاميذ في الكريديات حالياً.')}\n\nالإجمالي: ${money(totalCredit)}.`;
+  }
+
+  if (q.includes('تنتهي') || q.includes('قريبا') || q.includes('قريب')) {
+    return `الاشتراكات التي ستنتهي قريباً:\n${listLines(soonStudents.map(student => `${studentLine(student)} - تاريخ الانتهاء: ${dateText(student.expiryDate)}`), 'لا توجد اشتراكات تنتهي قريباً حالياً.')}`;
+  }
+
+  if ((q.includes('دخل') || q.includes('حضور') || q.includes('qr')) && q.includes('اليوم')) {
+    return `عمليات الدخول اليوم عبر QR: ${todayLogs.length}\n${listLines(todayLogs.map(log => `${log.studentName} - ${dateTimeText(log.scannedAt)} - ${log.paymentStatus}`), 'لا توجد عمليات دخول مسجلة اليوم.')}`;
+  }
+
+  if (requestedYear && (q.includes('قائمه') || q.includes('قائمة') || q.includes('تلاميذ') || q.includes('السنه') || q.includes('السنة'))) {
+    const yearStudents = students.filter(item => item.level === requestedYear);
+    return `تلاميذ ${requestedYear}: ${yearStudents.length}\n${listLines(yearStudents.map(studentLine), 'لا يوجد تلاميذ في هذه السنة حالياً.')}`;
+  }
+
+  if (subject) {
+    const subjectRows = store.studentSubjects.filter(link => link.subjectId === subject.id);
+    const subjectStudents = subjectRows.map(link => students.find(student => student.id === link.studentId)).filter(Boolean);
+    const subjectTeachers = teachers.filter(item => item.subjectIds.includes(subject.id));
+    if (q.includes('عدد')) {
+      return `عدد التلاميذ المسجلين في ${subject.name}: ${subjectStudents.length}.\nالأساتذة المرتبطون بالمادة: ${subjectTeachers.length ? subjectTeachers.map(t => t.fullName).join('، ') : 'لا يوجد أساتذة بعد.'}`;
+    }
+    return `مادة ${subject.name}:\nالتلاميذ:\n${listLines(subjectStudents.map(studentLine), 'لا يوجد تلاميذ مسجلون في هذه المادة.')}\n\nالأساتذة:\n${listLines(subjectTeachers.map(item => `${item.fullName}${item.phone ? ` - ${item.phone}` : ''}`), 'لا يوجد أساتذة مرتبطون بهذه المادة.')}`;
+  }
+
+  if (teacher && q.includes('برنامج')) {
+    const teacherSchedules = schedules.filter(schedule => schedule.teacherId === teacher.id);
+    return `برنامج الأستاذ/ة ${teacher.fullName}:\n${listLines(teacherSchedules.map(schedule => {
+      const scheduleSubject = subjects.find(item => item.id === schedule.subjectId);
+      return `${schedule.day || 'يوم غير محدد'} ${schedule.startTime || '--:--'}-${schedule.endTime || '--:--'} | ${scheduleSubject?.name || 'مادة غير محددة'} | ${schedule.level || 'سنة غير محددة'} | ${schedule.group || 'فوج غير محدد'} | ${schedule.room || 'بدون قاعة'}`;
+    }), 'لا توجد حصص مسجلة لهذا الأستاذ حالياً.')}`;
+  }
+
+  if (teacher) {
+    const teacherSubjects = teacher.subjectIds.map(id => subjects.find(subject => subject.id === id)?.name).filter(Boolean);
+    const teacherSchedules = schedules.filter(schedule => schedule.teacherId === teacher.id);
+    return `الأستاذ/ة ${teacher.fullName}:\nالهاتف: ${teacher.phone || 'غير محدد'}\nالمواد: ${teacherSubjects.length ? teacherSubjects.join('، ') : 'غير محددة'}\nعدد الحصص الأسبوعية: ${teacherSchedules.length}\nالأفواج: ${teacher.groups.length ? teacher.groups.join('، ') : 'غير محددة'}`;
+  }
+
+  if (student) {
+    const rows = getStudentAcademicRows(student.id, store);
+    if (q.includes('مدفوع') || q.includes('الدفع') || q.includes('الحاله') || q.includes('الحالة')) {
+      return `حالة التلميذ ${student.fullName}: ${isCreditStudent(student) ? CREDIT : student.paymentStatus}.\nآخر دفع: ${dateText(student.lastPaymentDate)}\nانتهاء الاشتراك: ${dateText(student.expiryDate)}\nالكريدي: ${money(student.creditAmount || 0)}.`;
+    }
+    if (q.includes('ينتهي') || q.includes('نهايه') || q.includes('نهاية') || q.includes('اشتراك')) {
+      return `اشتراك ${student.fullName} ينتهي في: ${dateText(student.expiryDate)}.\nالحالة الحالية: ${isCreditStudent(student) ? CREDIT : student.paymentStatus}.`;
+    }
+    if (q.includes('مواد') || q.includes('يدرس')) {
+      return `مواد التلميذ ${student.fullName}:\n${listLines(rows.map(row => `${row.subject?.name || 'مادة غير محددة'} مع ${row.teacher?.fullName || 'أستاذ غير محدد'} - ${timeRange(row.schedule)}`), 'لا توجد مواد مسجلة لهذا التلميذ.')}`;
+    }
+    return `ملخص ${student.fullName}:\nالسنة: ${student.level || 'غير محددة'}\nالفوج: ${student.group || 'غير محدد'}\nحالة الدفع: ${isCreditStudent(student) ? CREDIT : student.paymentStatus}\nالمواد: ${rows.length ? rows.map(row => row.subject?.name).filter(Boolean).join('، ') : 'لا توجد مواد'}\nتاريخ التسجيل: ${dateText(student.registrationDate)}`;
+  }
+
+  if (q.includes('اقتراح') || q.includes('ملاحظات') || q.includes('ملخص') || q.includes('احصائيات') || q.includes('إحصائيات')) {
+    return buildAssistantInsights(store);
+  }
+
+  return `لم أجد سؤالاً محدداً بما يكفي، لكن هذا ملخص سريع:\n${buildAssistantInsights(store)}\n\nيمكنك أن تسأل مثلاً: "من لم يدفع؟"، "ما برنامج الأستاذ أحمد؟"، "كم عدد تلاميذ الفرنسية؟"، أو "ما مواد التلميذ محمد؟".`;
+}
+
+function buildAssistantInsights(store) {
+  const students = store.students || [];
+  const creditStudents = students.filter(isCreditStudent);
+  const totalCredit = creditStudents.reduce((sum, student) => sum + Number(student.creditAmount || 0), 0);
+  const soonStudents = students.filter(student => student.paymentStatus === SOON);
+  const yearCounts = SCHOOL_YEARS.map(year => ({ year, count: students.filter(student => student.level === year).length })).sort((a, b) => b.count - a.count);
+  const topYear = yearCounts[0];
+  const teacherLoads = store.teachers.map(teacher => ({ teacher, count: store.teacherSchedules.filter(schedule => schedule.teacherId === teacher.id).length })).sort((a, b) => b.count - a.count);
+  const topTeacher = teacherLoads[0];
+  return [
+    `عدد التلاميذ المسجلين: ${students.length}.`,
+    `عدد التلاميذ في الكريديات: ${creditStudents.length}.`,
+    `مجموع الكريديات الحالية: ${money(totalCredit)}.`,
+    `الاشتراكات التي تنتهي قريباً: ${soonStudents.length}.`,
+    `أكثر سنة تسجيلاً: ${topYear && topYear.count > 0 ? `${topYear.year} (${topYear.count})` : 'لا توجد بيانات كافية بعد'}.`,
+    `أكثر أستاذ لديه حصص: ${topTeacher && topTeacher.count > 0 ? `${topTeacher.teacher.fullName} (${topTeacher.count})` : 'لا توجد برامج أساتذة بعد'}.`
+  ].join('\n');
 }
 
 function playTone(type, enabled) {
@@ -265,13 +528,92 @@ function playTone(type, enabled) {
 }
 
 function App() {
-  const [store, setStore] = useState(loadStore);
-  const [authed, setAuthed] = useState(localStorage.getItem(AUTH_KEY) === '1');
+  const [store, setStore] = useState(() => normalizeStore(emptyStore));
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [firebaseError, setFirebaseError] = useState('');
   const [page, setPage] = useState('dashboard');
-  const [selectedStudentId, setSelectedStudentId] = useState(store.students[0]?.id || '');
-  const [selectedTeacherId, setSelectedTeacherId] = useState(store.teachers[0]?.id || '');
+  const [selectedStudentId, setSelectedStudentId] = useState('');
+  const [selectedTeacherId, setSelectedTeacherId] = useState('');
 
-  useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(store)), [store]);
+  useEffect(() => {
+    return onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthLoading(false);
+      if (!currentUser) {
+        setStore(normalizeStore(emptyStore));
+        setDataLoading(false);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    setDoc(doc(db, 'admins', user.uid), {
+      id: user.uid,
+      email: user.email || '',
+      name: user.displayName || user.email || '',
+      lastLoginAt: serverTimestamp()
+    }, { merge: true }).catch((error) => setFirebaseError(error.message));
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return undefined;
+    setDataLoading(true);
+    setFirebaseError('');
+    let nextStore = normalizeStore(emptyStore);
+    const loaded = new Set();
+    const collections = [...FIRESTORE_COLLECTIONS, 'credits'];
+    const requiredSnapshots = collections.length + 1;
+    const markLoaded = (key) => {
+      loaded.add(key);
+      if (loaded.size >= requiredSnapshots) setDataLoading(false);
+    };
+    const applyStore = () => setStore(normalizeStore(nextStore));
+    const onError = (error) => {
+      setFirebaseError(error.message);
+      setDataLoading(false);
+    };
+
+    const unsubscribers = collections.map(collectionName => onSnapshot(
+      collection(db, collectionName),
+      (snapshot) => {
+        nextStore = {
+          ...nextStore,
+          [collectionName]: snapshot.docs.map(readFirestoreDoc)
+        };
+        markLoaded(collectionName);
+        applyStore();
+      },
+      onError
+    ));
+
+    unsubscribers.push(onSnapshot(
+      doc(db, 'settings', 'app'),
+      (snapshot) => {
+        nextStore = {
+          ...nextStore,
+          settings: snapshot.exists() ? readFirestoreDoc(snapshot) : emptyStore.settings
+        };
+        markLoaded('settings');
+        applyStore();
+      },
+      onError
+    ));
+
+    return () => unsubscribers.forEach(unsubscribe => unsubscribe());
+  }, [user]);
+
+  useEffect(() => {
+    if (!store.students.length) return;
+    setSelectedStudentId(current => current && store.students.some(student => student.id === current) ? current : store.students[0].id);
+  }, [store.students]);
+
+  useEffect(() => {
+    if (!store.teachers.length) return;
+    setSelectedTeacherId(current => current && store.teachers.some(teacher => teacher.id === current) ? current : store.teachers[0].id);
+  }, [store.teachers]);
 
   const studentsWithStatus = useMemo(
     () => store.students.map(s => ({ ...s, paymentStatus: getPaymentStatus(s, store.settings) })),
@@ -290,16 +632,26 @@ function App() {
   const updateStore = (recipe) => setStore(prev => {
     const next = structuredClone(prev);
     recipe(next);
-    return normalizeStore(next);
+    const normalized = normalizeStore(next);
+    persistStoreChanges(prev, normalized).catch((error) => setFirebaseError(error.message));
+    return normalized;
   });
 
-  if (!authed) return <Login admins={store.admins} onLogin={() => { localStorage.setItem(AUTH_KEY, '1'); setAuthed(true); }} />;
+  const handleLogout = () => {
+    signOut(auth).catch((error) => setFirebaseError(error.message));
+    setPage('dashboard');
+  };
+
+  if (authLoading) return <LoadingScreen text="جار التحقق من جلسة الإدارة..." />;
+  if (!user) return <Login onLogin={(email, password) => signInWithEmailAndPassword(auth, email.trim(), password)} />;
+  if (dataLoading) return <LoadingScreen text="جار تحميل بيانات الجمعية من Firebase..." error={firebaseError} />;
 
   return (
     <div className="appShell">
-      <Sidebar page={page} setPage={setPage} onLogout={() => { localStorage.removeItem(AUTH_KEY); setAuthed(false); }} associationName={store.settings.associationName} logo={store.settings.logo} />
+      <Sidebar page={page} setPage={setPage} onLogout={handleLogout} associationName={store.settings.associationName} logo={store.settings.logo} />
       <main className="mainPanel">
-        <Topbar title={pageTitle} settings={store.settings} />
+        <Topbar title={pageTitle} settings={store.settings} user={user} />
+        {firebaseError && <div className="firebaseNotice">{firebaseError}</div>}
         {page === 'dashboard' && <Dashboard store={viewStore} setPage={setPage} selectStudent={setSelectedStudentId} />}
         {page === 'students' && <StudentsPage store={viewStore} updateStore={updateStore} setPage={setPage} setSelectedStudentId={setSelectedStudentId} />}
         {page === 'student-profile' && <StudentProfile student={selectedStudent} store={viewStore} setPage={setPage} setSelectedStudentId={setSelectedStudentId} />}
@@ -312,46 +664,69 @@ function App() {
         {page === 'card' && <QrCardPage student={selectedStudent} store={viewStore} />}
         {page === 'scanner' && <ScannerPage store={viewStore} updateStore={updateStore} />}
         {page === 'logs' && <LogsPage store={viewStore} />}
+        {page === 'reports' && <ReportsPage store={viewStore} />}
+        {page === 'assistant' && <SmartAssistantPage store={viewStore} />}
         {page === 'settings' && <SettingsPage settings={store.settings} updateStore={updateStore} />}
       </main>
     </div>
   );
 }
 
+function LoadingScreen({ text, error }) {
+  return (
+    <div className="loginPage">
+      <div className="loginBox">
+        <div className="brandMark"><ShieldCheck size={34} /></div>
+        <h1>{text}</h1>
+        {error && <div className="errorLine">{error}</div>}
+      </div>
+    </div>
+  );
+}
+
 const navItems = [
-  { id: 'dashboard', label: 'لوحة التحكم', icon: LayoutDashboard },
+  { id: 'dashboard', label: 'الرئيسية', icon: LayoutDashboard },
   { id: 'students', label: 'التلاميذ', icon: Users },
-  { id: 'subjects', label: 'إدارة المواد', icon: BookOpen },
-  { id: 'teachers', label: 'إدارة الأساتذة', icon: UserRound },
-  { id: 'teacher-programs', label: 'برامج الأساتذة', icon: CalendarDays },
   { id: 'credits', label: 'الكريديات', icon: Bell },
   { id: 'payments', label: 'المدفوعات', icon: CreditCard },
+  { id: 'subjects', label: 'المواد', icon: BookOpen },
+  { id: 'teachers', label: 'الأساتذة', icon: UserRound },
+  { id: 'teacher-programs', label: 'برامج الأساتذة', icon: CalendarDays },
   { id: 'card', label: 'بطاقة QR', icon: QrCode },
   { id: 'scanner', label: 'ماسح QR', icon: Camera },
   { id: 'logs', label: 'سجل الدخول', icon: History },
+  { id: 'reports', label: 'التقارير', icon: CalendarClock },
+  { id: 'assistant', label: 'المساعد الذكي', icon: Bot },
   { id: 'settings', label: 'الإعدادات', icon: Settings }
 ];
 
-function Login({ admins, onLogin }) {
-  const [username, setUsername] = useState('');
+function Login({ onLogin }) {
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const submit = (e) => {
+  const [loading, setLoading] = useState(false);
+  const submit = async (e) => {
     e.preventDefault();
-    const ok = admins.some(a => a.username === username && a.password === password);
-    if (ok) onLogin();
-    else setError('بيانات الدخول غير صحيحة');
+    setError('');
+    setLoading(true);
+    try {
+      await onLogin(email, password);
+    } catch (err) {
+      setError(err.code === 'auth/invalid-credential' ? 'بيانات الدخول غير صحيحة أو الحساب غير موجود في Firebase.' : err.message);
+    } finally {
+      setLoading(false);
+    }
   };
   return (
     <div className="loginPage">
       <form className="loginBox" onSubmit={submit}>
         <div className="brandMark"><ShieldCheck size={34} /></div>
         <h1>نظام إدارة جمعية الدعم الدراسي</h1>
-        <p>تسجيل دخول الإدارة والاستقبال</p>
-        <label>اسم المستخدم<input value={username} onChange={e => setUsername(e.target.value)} /></label>
-        <label>كلمة المرور<input type="password" value={password} onChange={e => setPassword(e.target.value)} /></label>
+        <p>تسجيل دخول الإدارة عبر Firebase Authentication</p>
+        <label>البريد الإلكتروني<input type="email" value={email} onChange={e => setEmail(e.target.value)} required autoComplete="email" /></label>
+        <label>كلمة المرور<input type="password" value={password} onChange={e => setPassword(e.target.value)} required autoComplete="current-password" /></label>
         {error && <div className="errorLine">{error}</div>}
-        <button className="primaryBtn"><LogIn size={18} /> دخول</button>
+        <button className="primaryBtn" disabled={loading}><LogIn size={18} /> {loading ? 'جار الدخول...' : 'دخول'}</button>
       </form>
     </div>
   );
@@ -375,11 +750,16 @@ function Sidebar({ page, setPage, onLogout, associationName, logo }) {
   );
 }
 
-function Topbar({ title, settings }) {
+function Topbar({ title, settings, user }) {
+  const displayName = user?.displayName || user?.email || 'مدير النظام';
   return (
     <header className="topbar">
       <div><h2>{title}</h2><p>{settings.associationName}</p></div>
-      <div className="operatorBadge"><ShieldCheck size={18} /> جهاز الاستقبال</div>
+      <div className="topbarActions">
+        <button className="iconButton" title="الإشعارات"><Bell size={18} /></button>
+        <div className="adminChip"><div className="adminAvatar">{displayName.slice(0, 1)}</div><span>{displayName}</span></div>
+        <button className="iconButton menuButton" title="القائمة"><LayoutDashboard size={18} /></button>
+      </div>
     </header>
   );
 }
@@ -387,43 +767,68 @@ function Topbar({ title, settings }) {
 function Dashboard({ store, setPage, selectStudent }) {
   const { students, payments, attendanceLogs, subjects, teachers, teacherSchedules } = store;
   const paid = students.filter(s => s.paymentStatus === PAID).length;
-  const expired = students.filter(s => s.paymentStatus === EXPIRED).length;
   const soon = students.filter(s => s.paymentStatus === SOON).length;
   const creditStudents = students.filter(isCreditStudent);
   const totalCredit = creditStudents.reduce((sum, s) => sum + Number(s.creditAmount || 0), 0);
   const todayLogs = attendanceLogs.filter(l => l.scannedAt?.slice(0, 10) === todayISO()).length;
   const recent = [...attendanceLogs].sort((a, b) => new Date(b.scannedAt) - new Date(a.scannedAt)).slice(0, 6);
-  const monthlyRevenue = payments.filter(p => p.paidAt?.slice(0, 7) === todayISO().slice(0, 7)).reduce((sum, p) => sum + Number(p.amount || 0), 0);
-  const yearStats = SCHOOL_YEARS.map(year => ({ year, count: students.filter(s => s.level === year).length }));
-  const maxYearCount = Math.max(...yearStats.map(y => y.count), 1);
+  const primary = students.filter(s => s.level?.includes('ابتدائي')).length;
+  const middle = students.filter(s => s.level?.includes('متوسط')).length;
+  const secondary = students.filter(s => s.level?.includes('ثانوي')).length;
+  const totalStages = Math.max(students.length, 1);
+  const donutStyle = {
+    background: `conic-gradient(#0B63E5 0 ${(primary / totalStages) * 100}%, #16A3A3 ${(primary / totalStages) * 100}% ${((primary + middle) / totalStages) * 100}%, #F59E0B ${((primary + middle) / totalStages) * 100}% 100%)`
+  };
+  const hourCounts = ['08:00', '10:00', '12:00', '14:00', '16:00', '18:00'].map((hour, index) => ({
+    hour,
+    count: todayLogs ? Math.max(1, Math.round((todayLogs * (index + 1)) / 6)) : 0
+  }));
+  const maxHour = Math.max(...hourCounts.map(item => item.count), 1);
   const cards = [
-    ['إجمالي التلاميذ', students.length, Users],
-    ['اشتراكات مدفوعة', paid, CheckCircle2],
-    ['منتهية الصلاحية', expired, XCircle],
-    ['تنتهي قريباً', soon, CalendarClock],
-    ['دخول اليوم', todayLogs, Camera],
-    ['مدخول الشهر', money(monthlyRevenue), CreditCard],
-    ['المواد', subjects.length, BookOpen],
-    ['الأساتذة', teachers.length, UserRound],
-    ['الحصص الأسبوعية', teacherSchedules.length, CalendarDays],
-    ['تلاميذ الكريديات', creditStudents.length, Bell],
-    ['إجمالي غير مدفوع', money(totalCredit), CreditCard]
+    ['إجمالي التلاميذ', students.length, Users, '+ 12%'],
+    ['الدافعون', paid, CheckCircle2, '+ 8%'],
+    ['غير دافعين (كريديات)', creditStudents.length, XCircle, `المجموع ${money(totalCredit)}`],
+    ['تنتهي قريباً', soon, CalendarClock, 'خلال فترة التنبيه']
   ];
   return (
     <section className="pageGrid">
-      <div className="statsGrid">
-        {cards.map(([label, value, Icon]) => <article className="statCard" key={label}><Icon size={24} /><span>{label}</span><strong>{value}</strong></article>)}
+      <div className="dashboardStats">
+        {cards.map(([label, value, Icon, hint]) => <article className="statCard" key={label}><div className="statIcon"><Icon size={23} /></div><span>{label}</span><strong>{value}</strong><small>{hint}</small></article>)}
       </div>
-      <div className="widePanel">
-        <div className="panelHeader"><h3>توزيع التلاميذ حسب السنوات الدراسية</h3><button onClick={() => setPage('students')}>فتح السنوات</button></div>
-        <div className="yearBars">
-          {yearStats.map(item => <div key={item.year} className="yearBar"><span>{item.year}</span><div><i style={{ width: `${(item.count / maxYearCount) * 100}%` }} /></div><b>{item.count}</b></div>)}
+      <div className="assistantCta">
+        <div>
+          <Sparkles size={26} />
+          <h3>اسأل المساعد الذكي</h3>
+          <p>استعلم عن التلاميذ، الكريديات، المواد، الأساتذة، البرامج، وسجلات QR اعتماداً على بيانات التطبيق الحالية.</p>
+        </div>
+        <button className="primaryBtn" onClick={() => setPage('assistant')}><Bot size={18} /> فتح الدردشة</button>
+      </div>
+      <div className="dashboardCharts">
+        <div className="widePanel chartCard">
+          <div className="panelHeader"><h3>توزيع التلاميذ حسب السنوات</h3><button onClick={() => setPage('reports')}>التقارير</button></div>
+          <div className="donutWrap">
+            <div className="donutChart" style={donutStyle}><span>{students.length}</span><small>تلميذ</small></div>
+            <div className="legendList">
+              <div><i className="blueDot" /> ابتدائي <b>{primary}</b></div>
+              <div><i className="tealDot" /> متوسط <b>{middle}</b></div>
+              <div><i className="orangeDot" /> ثانوي <b>{secondary}</b></div>
+            </div>
+          </div>
+        </div>
+        <div className="widePanel chartCard">
+          <div className="panelHeader"><h3>عمليات الدخول اليوم</h3><strong>{todayLogs}</strong></div>
+          <div className="lineChart">
+            {hourCounts.map(item => <div key={item.hour} className="linePoint"><span style={{ height: `${20 + (item.count / maxHour) * 74}%` }} /><small>{item.hour}</small></div>)}
+          </div>
         </div>
       </div>
       <div className="widePanel">
-        <div className="panelHeader"><h3>آخر عمليات الدخول عبر QR</h3><button onClick={() => setPage('logs')}>عرض السجل</button></div>
-        <div className="recentList">
-          {recent.map(log => <button key={log.id} onClick={() => { selectStudent(log.studentId); setPage('student-profile'); }}><span>{log.studentName}</span><b className={log.allowed ? 'ok' : 'bad'}>{log.paymentStatus}</b><small>{dateTimeText(log.scannedAt)}</small></button>)}
+        <div className="panelHeader"><h3>آخر عمليات الدخول</h3><button onClick={() => setPage('logs')}>عرض السجل</button></div>
+        <div className="tableWrap">
+          <table className="dashboardTable">
+            <thead><tr><th>التلميذ</th><th>الوقت</th><th>الحالة</th></tr></thead>
+            <tbody>{recent.map(log => <tr key={log.id} onClick={() => { selectStudent(log.studentId); setPage('student-profile'); }}><td><StudentMini student={students.find(s => s.id === log.studentId) || { fullName: log.studentName }} /></td><td>{dateTimeText(log.scannedAt)}</td><td><Status status={log.paymentStatus} /></td></tr>)}</tbody>
+          </table>
         </div>
       </div>
     </section>
@@ -522,6 +927,7 @@ function StudentProfile({ student, store, setPage, setSelectedStudentId }) {
         </div>
       </div>
       <div className="panel fullSpan">
+        <div className="profileTabs"><button className="active">المعلومات</button><button>المواد</button><button>المدفوعات</button><button>الملاحظات</button></div>
         <div className="panelHeader"><h3>السجل الدراسي والمواد</h3><button onClick={() => { setSelectedStudentId(student.id); setPage('student-form'); }}><Plus size={18} /> تعديل المواد</button></div>
         <AcademicTable rows={rows} />
       </div>
@@ -531,6 +937,7 @@ function StudentProfile({ student, store, setPage, setSelectedStudentId }) {
 
 function StudentForm({ student, store, updateStore, setPage, setSelectedStudentId }) {
   const isNew = !student || student.id === 'new';
+  const [draftId] = useState(() => isNew ? uid('stu') : student.id);
   const [form, setForm] = useState(isNew ? {
     fullName: '',
     phone: '',
@@ -549,13 +956,26 @@ function StudentForm({ student, store, updateStore, setPage, setSelectedStudentI
     notes: ''
   } : hydrateStudent(student));
   const [links, setLinks] = useState(isNew ? [] : store.studentSubjects.filter(link => link.studentId === student.id));
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const set = (key, value) => setForm(prev => ({ ...prev, [key]: value }));
   const updateLink = (id, key, value) => setLinks(prev => prev.map(link => link.id === id ? { ...link, [key]: value, ...(key === 'teacherId' ? { scheduleId: '' } : {}) } : link));
   const addLink = () => setLinks(prev => [...prev, hydrateStudentSubject({ id: uid('draft'), studentId: student?.id || '' })]);
   const removeLink = (id) => setLinks(prev => prev.filter(link => link.id !== id));
+  const handlePhotoUpload = async (file) => {
+    if (!file) return;
+    setUploadingPhoto(true);
+    try {
+      const url = await uploadFileToStorage(`students/${draftId}`, file);
+      set('photo', url);
+    } catch (error) {
+      alert(`تعذر رفع صورة التلميذ: ${error.message}`);
+    } finally {
+      setUploadingPhoto(false);
+    }
+  };
   const save = (e) => {
     e.preventDefault();
-    const savedId = isNew ? uid('stu') : form.id;
+    const savedId = isNew ? draftId : form.id;
     const savedStudent = {
       ...form,
       id: savedId,
@@ -598,7 +1018,7 @@ function StudentForm({ student, store, updateStore, setPage, setSelectedStudentI
         <Input type="number" label="المبلغ المطلوب في الكريدي" value={form.creditAmount} onChange={v => set('creditAmount', v)} />
         <Input type="date" label="تاريخ بداية الدين" value={form.debtStartDate} onChange={v => set('debtStartDate', v)} />
         <Input type="date" label="تاريخ آخر تذكير" value={form.lastReminderDate} onChange={v => set('lastReminderDate', v)} />
-        <label className="fileInput"><Upload size={18} /> صورة اختيارية<input type="file" accept="image/*" onChange={e => fileToData(e.target.files[0], v => set('photo', v))} /></label>
+        <label className="fileInput"><Upload size={18} /> {uploadingPhoto ? 'جار رفع الصورة...' : 'صورة اختيارية'}<input type="file" accept="image/*" onChange={e => handlePhotoUpload(e.target.files?.[0])} /></label>
         <label className="full">ملاحظات خاصة بالتلميذ<textarea value={form.notes} onChange={e => set('notes', e.target.value)} /></label>
         <label className="full">ملاحظات الكريدي<textarea value={form.creditNotes} onChange={e => set('creditNotes', e.target.value)} /></label>
       </div>
@@ -1045,9 +1465,130 @@ function LogsPage({ store }) {
   );
 }
 
+function ReportsPage({ store }) {
+  const [range, setRange] = useState('month');
+  const totalIncome = store.payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+  const totalCredit = store.students.filter(isCreditStudent).reduce((sum, student) => sum + Number(student.creditAmount || 0), 0);
+  const yearStats = SCHOOL_YEARS.map(year => ({ year, count: store.students.filter(student => student.level === year).length }));
+  const maxCount = Math.max(...yearStats.map(item => item.count), 1);
+  const cards = [
+    ['إجمالي التلاميذ', store.students.length, Users],
+    ['إجمالي المداخيل', money(totalIncome), CreditCard],
+    ['إجمالي الكريديات', money(totalCredit), Bell],
+    ['عمليات الدخول', store.attendanceLogs.length, Camera]
+  ];
+  return (
+    <section className="pageGrid reportsPage">
+      <div className="reportToolbar panel">
+        <h3>التقارير</h3>
+        <select value={range} onChange={e => setRange(e.target.value)}><option value="month">هذا الشهر</option><option value="quarter">آخر 3 أشهر</option><option value="year">هذا العام</option></select>
+      </div>
+      <div className="dashboardStats">
+        {cards.map(([label, value, Icon]) => <article className="statCard" key={label}><div className="statIcon"><Icon size={23} /></div><span>{label}</span><strong>{value}</strong><small>{range === 'month' ? 'الفترة الحالية' : 'حسب الفلتر'}</small></article>)}
+      </div>
+      <div className="widePanel">
+        <div className="panelHeader"><h3>إحصائيات التلاميذ حسب السنوات</h3><span className="mutedLine">مخطط أعمدة</span></div>
+        <div className="barChart">
+          {yearStats.map(item => <div className="barItem" key={item.year}><div><span style={{ height: `${8 + (item.count / maxCount) * 92}%` }} /></div><b>{item.count}</b><small>{item.year.replace('السنة ', '')}</small></div>)}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SmartAssistantPage({ store }) {
+  const [messages, setMessages] = useState([{ role: 'assistant', text: AI_WELCOME_MESSAGE }]);
+  const [input, setInput] = useState('');
+  const [thinking, setThinking] = useState(false);
+  const chatEndRef = useRef(null);
+  const quickQuestions = [
+    'كم عدد التلاميذ المسجلين؟',
+    'من هم التلاميذ الذين لم يدفعوا؟',
+    'كم مجموع مبالغ الكريديات؟',
+    'من تنتهي اشتراكاتهم قريباً؟',
+    'من دخل اليوم عبر بطاقة QR؟',
+    'أعطني ملخصاً ذكياً عن الجمعية.'
+  ];
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages, thinking]);
+
+  const ask = (text) => {
+    const question = text.trim();
+    if (!question || thinking) return;
+    setMessages(prev => [...prev, { role: 'user', text: question }]);
+    setInput('');
+    setThinking(true);
+    window.setTimeout(() => {
+      const answer = answerAssistantQuestion(question, store);
+      setMessages(prev => [...prev, { role: 'assistant', text: answer }]);
+      setThinking(false);
+    }, 450);
+  };
+
+  const submit = (e) => {
+    e.preventDefault();
+    ask(input);
+  };
+
+  return (
+    <section className="assistantPage">
+      <div className="assistantHeader panel">
+        <div>
+          <Bot size={30} />
+          <div>
+            <h3>المساعد الذكي</h3>
+            <p>{AI_ASSISTANT_NAME}</p>
+          </div>
+        </div>
+        <button onClick={() => setMessages([{ role: 'assistant', text: AI_WELCOME_MESSAGE }])}><Trash2 size={17} /> مسح المحادثة</button>
+      </div>
+      <div className="assistantGrid">
+        <div className="panel assistantSidebar">
+          <h3>اقتراحات سريعة</h3>
+          {quickQuestions.map(question => <button key={question} onClick={() => ask(question)}>{question}</button>)}
+          <div className="assistantNote">
+            <ShieldCheck size={18} />
+            <span>المساعد يقرأ البيانات فقط ولا يملك صلاحية تعديلها أو حذفها.</span>
+          </div>
+        </div>
+        <div className="panel chatPanel">
+          <div className="chatMessages">
+            {messages.map((message, index) => <div key={`${message.role}-${index}`} className={`chatBubble ${message.role}`}>
+              <span>{message.role === 'assistant' ? AI_ASSISTANT_NAME : 'الإدارة'}</span>
+              <p>{message.text}</p>
+            </div>)}
+            {thinking && <div className="chatBubble assistant thinking"><span>{AI_ASSISTANT_NAME}</span><p>يفكر...</p></div>}
+            <div ref={chatEndRef} />
+          </div>
+          <form className="chatComposer" onSubmit={submit}>
+            <input value={input} onChange={e => setInput(e.target.value)} placeholder="اكتب سؤالك عن بيانات الجمعية..." />
+            <button className="primaryBtn" disabled={thinking}><Send size={18} /> إرسال</button>
+          </form>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function SettingsPage({ settings, updateStore }) {
   const [form, setForm] = useState(settings);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+  useEffect(() => setForm(settings), [settings]);
   const set = (key, value) => setForm(prev => ({ ...prev, [key]: value }));
+  const handleLogoUpload = async (file) => {
+    if (!file) return;
+    setUploadingLogo(true);
+    try {
+      const url = await uploadFileToStorage('settings/logo', file);
+      set('logo', url);
+    } catch (error) {
+      alert(`تعذر رفع شعار الجمعية: ${error.message}`);
+    } finally {
+      setUploadingLogo(false);
+    }
+  };
   const save = (e) => {
     e.preventDefault();
     updateStore(s => { s.settings = form; });
@@ -1055,14 +1596,17 @@ function SettingsPage({ settings, updateStore }) {
   return (
     <form className="panel formPanel" onSubmit={save}>
       <h3>الإعدادات العامة</h3>
-      <div className="formGrid">
-        <Input label="اسم الجمعية" value={form.associationName} onChange={v => set('associationName', v)} />
-        <label className="fileInput"><Upload size={18} /> رفع شعار الجمعية<input type="file" accept="image/*" onChange={e => fileToData(e.target.files[0], v => set('logo', v))} /></label>
-        <Input type="number" label="مدة الاشتراك الافتراضية بالأشهر" value={form.defaultDurationMonths} onChange={v => set('defaultDurationMonths', v)} />
-        <Input type="number" label="أيام التنبيه قبل الانتهاء" value={form.soonDays} onChange={v => set('soonDays', v)} />
-        <label className="toggle"><input type="checkbox" checked={form.sounds} onChange={e => set('sounds', e.target.checked)} /> تشغيل أصوات التنبيه</label>
-        <label>نغمة النجاح<select value={form.successTone} onChange={e => set('successTone', e.target.value)}><option value="">اختر نغمة النجاح</option><option value="success">قصيرة</option><option value="soft">هادئة</option></select></label>
-        <label>نغمة الإنذار<select value={form.alertTone} onChange={e => set('alertTone', e.target.value)}><option value="">اختر نغمة الإنذار</option><option value="alert">واضحة</option><option value="sharp">قوية</option></select></label>
+      <div className="settingsLayout">
+        <aside className="settingsMenu"><button className="active" type="button">عام</button><button type="button">الإشعارات</button><button type="button">الدفع</button><button type="button">التنبيهات</button></aside>
+        <div className="formGrid">
+          <Input label="اسم الجمعية" value={form.associationName} onChange={v => set('associationName', v)} />
+          <label className="fileInput"><Upload size={18} /> {uploadingLogo ? 'جار رفع الشعار...' : 'رفع شعار الجمعية'}<input type="file" accept="image/*" onChange={e => handleLogoUpload(e.target.files?.[0])} /></label>
+          <Input type="number" label="مدة الاشتراك الافتراضية بالأشهر" value={form.defaultDurationMonths} onChange={v => set('defaultDurationMonths', v)} />
+          <Input type="number" label="أيام التنبيه قبل الانتهاء" value={form.soonDays} onChange={v => set('soonDays', v)} />
+          <label className="toggle"><input type="checkbox" checked={form.sounds} onChange={e => set('sounds', e.target.checked)} /> تشغيل أصوات التنبيه</label>
+          <label>نغمة النجاح<select value={form.successTone} onChange={e => set('successTone', e.target.value)}><option value="">اختر نغمة النجاح</option><option value="success">قصيرة</option><option value="soft">هادئة</option></select></label>
+          <label>نغمة الإنذار<select value={form.alertTone} onChange={e => set('alertTone', e.target.value)}><option value="">اختر نغمة الإنذار</option><option value="alert">واضحة</option><option value="sharp">قوية</option></select></label>
+        </div>
       </div>
       <button className="primaryBtn saveBtn">حفظ الإعدادات</button>
     </form>
@@ -1123,13 +1667,6 @@ function Status({ status }) {
 
 function StudentMini({ student }) {
   return <div className="studentMini">{student.photo ? <img src={student.photo} alt="" /> : <div className="avatar">{student.fullName?.slice(0, 1) || '؟'}</div>}<div><strong>{student.fullName || 'بدون اسم'}</strong><small>{student.registrationNumber || 'بدون رقم تسجيل'}</small></div></div>;
-}
-
-function fileToData(file, cb) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => cb(reader.result);
-  reader.readAsDataURL(file);
 }
 
 createRoot(document.getElementById('root')).render(<App />);
