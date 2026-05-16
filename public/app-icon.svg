@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="جمعية الدعم الدراسي">
+  <defs>
+    <linearGradient id="bg" x1="80" x2="432" y1="52" y2="460" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B63E5"/>
+      <stop offset="1" stop-color="#0647A8"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="118" fill="url(#bg)"/>
+  <circle cx="256" cy="184" r="74" fill="#EAF3FF"/>
+  <path d="M165 346c17-56 55-88 91-88s74 32 91 88c6 19-8 38-28 38H193c-20 0-34-19-28-38Z" fill="#FFFFFF"/>
+  <path d="M181 153h150c14 0 25 11 25 25v88c0 14-11 25-25 25H181c-14 0-25-11-25-25v-88c0-14 11-25 25-25Z" fill="#FFFFFF" opacity=".92"/>
+  <path d="M202 190h108M202 224h78M202 258h96" stroke="#0B63E5" stroke-width="18" stroke-linecap="round"/>
+  <path d="M256 95 387 148 256 201 125 148 256 95Z" fill="#10233E"/>
+  <path d="M180 169v64c0 30 34 54 76 54s76-24 76-54v-64" fill="none" stroke="#10233E" stroke-width="20" stroke-linecap="round"/>
+</svg>

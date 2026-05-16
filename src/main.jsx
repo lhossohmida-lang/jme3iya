@@ -38,7 +38,7 @@ import {
 import { auth, db, uploadFileToStorage } from './firebase';
 import './styles.css';
 
-const FIRESTORE_COLLECTIONS = ['students', 'schoolYears', 'teachers', 'subjects', 'teacherSchedules', 'studentSubjects', 'payments', 'attendanceLogs', 'admins'];
+const FIRESTORE_COLLECTIONS = ['students', 'teachers', 'subjects', 'teacherSchedules', 'studentSubjects', 'payments', 'attendanceLogs'];
 const ALL = 'الكل';
 const PAID = 'مدفوع';
 const UNPAID = 'غير مدفوع';
@@ -332,6 +332,8 @@ function normalizeSearchText(value) {
     .normalize('NFKD')
     .replace(/[\u064B-\u065F]/g, '')
     .replace(/[أإآ]/g, 'ا')
+    .replace(/ؤ/g, 'و')
+    .replace(/ئ/g, 'ي')
     .replace(/ى/g, 'ي')
     .replace(/ة/g, 'ه')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
@@ -339,28 +341,81 @@ function normalizeSearchText(value) {
     .trim();
 }
 
-function listLines(items, emptyText = 'لا توجد نتائج حالياً.') {
-  return items.length ? items.map((item, index) => `${index + 1}. ${item}`).join('\n') : emptyText;
+const ARABIC_STOP_WORDS = new Set([
+  'ما', 'ماذا', 'من', 'هل', 'كم', 'كيف', 'اين', 'متي', 'متى', 'عن', 'على', 'في', 'الى', 'إلى',
+  'ال', 'هذا', 'هذه', 'ذلك', 'تلك', 'كل', 'جميع', 'اعطني', 'اريد', 'اظهر', 'عرض', 'قائمه',
+  'قائمة', 'بيانات', 'معلومات', 'خاص', 'الخاصة', 'لدي', 'عندي', 'داخل', 'التطبيق', 'الجمعيه',
+  'الجمعية', 'اليوم', 'الشهر', 'السنه', 'السنة', 'الحالي', 'الحالية'
+].map(normalizeSearchText));
+
+function tokenizeArabic(value) {
+  return normalizeSearchText(value)
+    .split(' ')
+    .filter(token => token.length > 1 && !ARABIC_STOP_WORDS.has(token));
+}
+
+function includesAny(text, words) {
+  const normalized = normalizeSearchText(text);
+  return words.some(word => normalized.includes(normalizeSearchText(word)));
+}
+
+function listLines(items, emptyText = 'لا توجد نتائج حالياً.', limit = 12) {
+  if (!items.length) return emptyText;
+  const visible = items.slice(0, limit).map((item, index) => `${index + 1}. ${item}`).join('\n');
+  const hidden = items.length - limit;
+  return hidden > 0 ? `${visible}\n... و${hidden} نتيجة أخرى.` : visible;
 }
 
 function studentLine(student) {
   return `${student.fullName || 'بدون اسم'} - ${student.level || 'سنة غير محددة'} - ${student.group || 'فوج غير محدد'} - الحالة: ${student.paymentStatus}`;
 }
 
-function findStudentByQuestion(question, students) {
+function scoreEntity(question, fields) {
   const q = normalizeSearchText(question);
-  return students.find(student => {
-    const name = normalizeSearchText(student.fullName);
-    return name && (q.includes(name) || name.split(' ').filter(Boolean).some(part => part.length > 2 && q.includes(part)));
+  const tokens = tokenizeArabic(question);
+  const haystack = normalizeSearchText(fields.filter(Boolean).join(' '));
+  const mainName = normalizeSearchText(fields[0] || '');
+  const digits = String(question).replace(/\D/g, '');
+  let score = 0;
+
+  if (mainName && q.includes(mainName)) score += 20;
+  if (digits && haystack.replace(/\D/g, '').includes(digits)) score += 12;
+
+  tokens.forEach(token => {
+    if (token.length > 2 && haystack.includes(token)) score += token.length > 4 ? 3 : 2;
   });
+
+  return score;
+}
+
+function findBestEntity(question, items, getFields, minScore = 2) {
+  let best = null;
+  items.forEach(item => {
+    const score = scoreEntity(question, getFields(item));
+    if (!best || score > best.score) best = { item, score };
+  });
+  return best && best.score >= minScore ? best.item : null;
+}
+
+function findStudentByQuestion(question, students) {
+  return findBestEntity(question, students, student => [
+    student.fullName,
+    student.registrationNumber,
+    student.phone,
+    student.guardianName,
+    student.guardianPhone,
+    student.level,
+    student.group
+  ], 3);
 }
 
 function findTeacherByQuestion(question, teachers) {
-  const q = normalizeSearchText(question);
-  return teachers.find(teacher => {
-    const name = normalizeSearchText(teacher.fullName);
-    return name && (q.includes(name) || name.split(' ').filter(Boolean).some(part => part.length > 2 && q.includes(part)));
-  });
+  return findBestEntity(question, teachers, teacher => [
+    teacher.fullName,
+    teacher.phone,
+    ...(teacher.groups || []),
+    ...(teacher.levels || [])
+  ], 3);
 }
 
 function findSubjectByQuestion(question, subjects) {
@@ -382,104 +437,313 @@ function findSubjectByQuestion(question, subjects) {
     const name = normalizeSearchText(subject.name);
     if (name && q.includes(name)) return true;
     return aliases.some(([alias, canonical]) => q.includes(normalizeSearchText(alias)) && name === normalizeSearchText(canonical));
-  });
+  }) || findBestEntity(question, subjects, subject => [subject.name, subject.notes], 2);
+}
+
+function findRequestedYear(question) {
+  const q = normalizeSearchText(question);
+  const exact = SCHOOL_YEARS.find(year => q.includes(normalizeSearchText(year)));
+  if (exact) return { year: exact, stage: '' };
+
+  const stage = [
+    { name: 'ابتدائي', keys: ['ابتدائي', 'ابتدايي'] },
+    { name: 'متوسط', keys: ['متوسط'] },
+    { name: 'ثانوي', keys: ['ثانوي'] }
+  ].find(item => item.keys.some(key => q.includes(normalizeSearchText(key))))?.name || '';
+
+  const ordinal = [
+    { label: 'الأولى', keys: ['الاولي', 'اولى', 'اول'] },
+    { label: 'الثانية', keys: ['الثانيه', 'ثانيه', 'ثاني'] },
+    { label: 'الثالثة', keys: ['الثالثه', 'ثالثه', 'ثالث'] },
+    { label: 'الرابعة', keys: ['الرابعه', 'رابعه', 'رابع'] },
+    { label: 'الخامسة', keys: ['الخامسه', 'خامسه', 'خامس'] }
+  ].find(item => item.keys.some(key => q.includes(normalizeSearchText(key))))?.label || '';
+
+  const year = stage && ordinal
+    ? SCHOOL_YEARS.find(item => normalizeSearchText(item).includes(normalizeSearchText(ordinal)) && normalizeSearchText(item).includes(normalizeSearchText(stage)))
+    : '';
+
+  return { year: year || '', stage };
+}
+
+function findRequestedGroup(question, students = []) {
+  const q = normalizeSearchText(question);
+  const groups = [...new Set(students.map(student => student.group).filter(Boolean))];
+  return groups.find(group => {
+    const normalized = normalizeSearchText(group);
+    return normalized && q.includes(normalized);
+  }) || '';
 }
 
 function hasStudentWord(text) {
-  return ['تلميذ', 'تلاميذ', 'طالب', 'طلاب'].some(word => text.includes(word));
+  return includesAny(text, ['تلميذ', 'تلاميذ', 'طالب', 'طلاب', 'مسجلين']);
 }
 
 function hasAmountWord(text) {
-  return ['مبلغ', 'مبالغ', 'مجموع', 'اجمالي', 'إجمالي'].some(word => text.includes(normalizeSearchText(word)));
+  return includesAny(text, ['مبلغ', 'مبالغ', 'مجموع', 'اجمالي', 'إجمالي', 'دين', 'مستحقات', 'مداخيل']);
 }
 
-function answerAssistantQuestion(question, store) {
+function getPaymentFilter(question) {
   const q = normalizeSearchText(question);
+  if (includesAny(q, ['كريدي', 'دين', 'ديون', 'مستحقات', 'لم يدفع', 'غير مدفوع', 'ما دفعش'])) return { label: CREDIT, test: isCreditStudent };
+  if (includesAny(q, ['منتهي', 'انتهى', 'انتهت', 'انتهاء الصلاحيه'])) return { label: EXPIRED, test: student => student.paymentStatus === EXPIRED };
+  if (includesAny(q, ['قريبا', 'قريب', 'ستنتهي', 'تنتهي قريبا'])) return { label: SOON, test: student => student.paymentStatus === SOON };
+  if (includesAny(q, ['مدفوع', 'دافع', 'دفع', 'سدد', 'خالص']) && !includesAny(q, ['غير مدفوع', 'لم يدفع'])) return { label: PAID, test: student => student.paymentStatus === PAID };
+  return null;
+}
+
+function getDateRange(question) {
+  const q = normalizeSearchText(question);
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date();
+  end.setHours(23, 59, 59, 999);
+
+  if (includesAny(q, ['البارح', 'امس'])) {
+    start.setDate(start.getDate() - 1);
+    end.setDate(end.getDate() - 1);
+    return { label: 'أمس', test: value => new Date(value) >= start && new Date(value) <= end };
+  }
+  if (includesAny(q, ['اليوم', 'نهار اليوم'])) return { label: 'اليوم', test: value => new Date(value) >= start && new Date(value) <= end };
+  if (includesAny(q, ['اسبوع', 'الأسبوع', 'الاسبوع'])) {
+    start.setDate(start.getDate() - 7);
+    return { label: 'آخر 7 أيام', test: value => new Date(value) >= start };
+  }
+  if (includesAny(q, ['شهر', 'الشهر'])) {
+    start.setDate(1);
+    return { label: 'هذا الشهر', test: value => new Date(value) >= start };
+  }
+  if (includesAny(q, ['عام', 'سنه', 'سنة'])) {
+    start.setMonth(0, 1);
+    return { label: 'هذا العام', test: value => new Date(value) >= start };
+  }
+  return { label: 'كل الفترات', test: value => Boolean(value) };
+}
+
+function makeAssistantContext(question, store) {
   const students = store.students || [];
   const subjects = store.subjects || [];
   const teachers = store.teachers || [];
-  const schedules = store.teacherSchedules || [];
-  const payments = store.payments || [];
-  const logs = store.attendanceLogs || [];
-  const creditStudents = students.filter(isCreditStudent);
-  const totalCredit = creditStudents.reduce((sum, student) => sum + Number(student.creditAmount || 0), 0);
-  const soonStudents = students.filter(student => student.paymentStatus === SOON);
-  const todayLogs = logs.filter(log => log.scannedAt?.slice(0, 10) === todayISO());
-  const student = findStudentByQuestion(question, students);
-  const teacher = findTeacherByQuestion(question, teachers);
-  const subject = findSubjectByQuestion(question, subjects);
-  const requestedYear = SCHOOL_YEARS.find(year => q.includes(normalizeSearchText(year)));
+  const year = findRequestedYear(question);
+  return {
+    q: normalizeSearchText(question),
+    tokens: tokenizeArabic(question),
+    dateRange: getDateRange(question),
+    paymentFilter: getPaymentFilter(question),
+    student: findStudentByQuestion(question, students),
+    teacher: findTeacherByQuestion(question, teachers),
+    subject: findSubjectByQuestion(question, subjects),
+    group: findRequestedGroup(question, students),
+    year,
+    wantsCount: includesAny(question, ['كم', 'عدد', 'احسب', 'حصيلة']),
+    wantsList: includesAny(question, ['من', 'قائمة', 'لائحة', 'اعطني', 'اظهر', 'عرض', 'كل', 'جميع']),
+    wantsSummary: includesAny(question, ['ملخص', 'تقرير', 'احصائيات', 'إحصائيات', 'نظرة', 'وضعية', 'تحليل', 'اقتراح']),
+    wantsHelp: includesAny(question, ['طريقة', 'استعمل', 'استخدم'])
+      || (includesAny(question, ['كيف', 'كيفاش']) && includesAny(question, ['اضيف', 'أضيف', 'اسجل', 'امسح', 'اطبع', 'اربط', 'احذف', 'استعمل', 'استخدم']))
+  };
+}
+
+function filterStudentsFromContext(store, context) {
+  const subjectStudentIds = context.subject
+    ? new Set(store.studentSubjects.filter(link => link.subjectId === context.subject.id).map(link => link.studentId))
+    : null;
+  const teacherStudentIds = context.teacher
+    ? new Set(store.studentSubjects.filter(link => link.teacherId === context.teacher.id).map(link => link.studentId))
+    : null;
+  let rows = [...(store.students || [])];
+
+  if (context.student) rows = rows.filter(student => student.id === context.student.id);
+  if (context.year.year) rows = rows.filter(student => student.level === context.year.year);
+  else if (context.year.stage) rows = rows.filter(student => normalizeSearchText(student.level).includes(normalizeSearchText(context.year.stage)));
+  if (context.group) rows = rows.filter(student => student.group === context.group);
+  if (subjectStudentIds) rows = rows.filter(student => subjectStudentIds.has(student.id));
+  if (teacherStudentIds) rows = rows.filter(student => teacherStudentIds.has(student.id));
+  if (context.paymentFilter) rows = rows.filter(context.paymentFilter.test);
+
+  return rows;
+}
+
+function formatStudentDetails(student, store) {
+  const rows = getStudentAcademicRows(student.id, store);
+  const payments = store.payments.filter(payment => payment.studentId === student.id).sort((a, b) => new Date(b.paidAt) - new Date(a.paidAt));
+  const logs = store.attendanceLogs.filter(log => log.studentId === student.id).sort((a, b) => new Date(b.scannedAt) - new Date(a.scannedAt));
+  return [
+    `ملف التلميذ ${student.fullName || 'بدون اسم'}:`,
+    `السنة: ${student.level || 'غير محددة'} | الفوج: ${student.group || 'غير محدد'} | رقم التسجيل: ${student.registrationNumber || 'غير محدد'}.`,
+    `الهاتف: ${student.phone || 'غير محدد'} | الولي: ${student.guardianName || 'غير محدد'} ${student.guardianPhone ? `(${student.guardianPhone})` : ''}.`,
+    `الدفع: ${isCreditStudent(student) ? CREDIT : student.paymentStatus} | آخر دفع: ${dateText(student.lastPaymentDate)} | نهاية الاشتراك: ${dateText(student.expiryDate)} | الكريدي: ${money(student.creditAmount || 0)}.`,
+    `المواد:\n${listLines(rows.map(row => `${row.subject?.name || 'مادة غير محددة'} مع ${row.teacher?.fullName || 'أستاذ غير محدد'} - ${timeRange(row.schedule)} - ${row.schedule?.room || 'بدون قاعة'}`), 'لا توجد مواد مسجلة لهذا التلميذ.', 8)}`,
+    `آخر الدفعات:\n${listLines(payments.map(payment => `${dateText(payment.paidAt)} - ${money(payment.amount)} - ${payment.durationLabel || 'مدة غير محددة'} إلى ${dateText(payment.expiryDate)}`), 'لا توجد دفعات مسجلة.', 5)}`,
+    `آخر الدخول عبر QR:\n${listLines(logs.map(log => `${dateTimeText(log.scannedAt)} - ${log.paymentStatus} - ${log.allowed ? 'مسموح' : 'تنبيه'}`), 'لا توجد عمليات دخول مسجلة.', 5)}`,
+    student.notes ? `ملاحظات: ${student.notes}` : ''
+  ].filter(Boolean).join('\n');
+}
+
+function buildStudentsAnswer(store, context) {
+  const rows = filterStudentsFromContext(store, context);
+  const labelParts = [
+    context.year.year || context.year.stage,
+    context.group && `الفوج ${context.group}`,
+    context.subject?.name,
+    context.teacher?.fullName,
+    context.paymentFilter?.label
+  ].filter(Boolean);
+  const label = labelParts.length ? labelParts.join(' / ') : 'كل التلاميذ';
+
+  if (context.wantsCount) return `عدد التلاميذ (${label}) هو: ${rows.length}.`;
+
+  return `قائمة التلاميذ (${label}) - العدد: ${rows.length}\n${listLines(rows.map(studentLine), 'لا توجد نتائج مطابقة لهذا السؤال.')}`;
+}
+
+function buildCreditAnswer(store, context) {
+  const rows = filterStudentsFromContext(store, { ...context, paymentFilter: { label: CREDIT, test: isCreditStudent } });
+  const total = rows.reduce((sum, student) => sum + Number(student.creditAmount || 0), 0);
+  return [
+    `الكريديات المطابقة للسؤال: ${rows.length} تلميذاً.`,
+    `إجمالي المبالغ غير المدفوعة: ${money(total)}.`,
+    listLines(rows.map(student => `${student.fullName || 'بدون اسم'} - ${student.level || 'سنة غير محددة'} - ${student.group || 'فوج غير محدد'} - ${money(student.creditAmount || 0)} - آخر تذكير: ${dateText(student.lastReminderDate)}`), 'لا توجد كريديات مطابقة.')
+  ].join('\n');
+}
+
+function buildPaymentAnswer(store, context) {
+  const range = context.dateRange;
+  let payments = (store.payments || []).filter(payment => range.test(payment.paidAt));
+  if (context.student) payments = payments.filter(payment => payment.studentId === context.student.id);
+  const total = payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+  return [
+    `المدفوعات (${range.label}): ${payments.length} عملية.`,
+    `إجمالي المبلغ: ${money(total)}.`,
+    listLines(payments.sort((a, b) => new Date(b.paidAt) - new Date(a.paidAt)).map(payment => {
+      const student = store.students.find(item => item.id === payment.studentId);
+      return `${student?.fullName || 'تلميذ غير معروف'} - ${money(payment.amount)} - ${dateText(payment.paidAt)} - ${payment.durationLabel || 'مدة غير محددة'} - انتهاء: ${dateText(payment.expiryDate)}`;
+    }), 'لا توجد مدفوعات في هذه الفترة.')
+  ].join('\n');
+}
+
+function buildAttendanceAnswer(store, context) {
+  const range = context.dateRange;
+  let logs = (store.attendanceLogs || []).filter(log => range.test(log.scannedAt));
+  if (context.student) logs = logs.filter(log => log.studentId === context.student.id);
+  if (context.paymentFilter) logs = logs.filter(log => log.paymentStatus === context.paymentFilter.label || (context.paymentFilter.label === CREDIT && log.paymentStatus === CREDIT));
+  const allowed = logs.filter(log => log.allowed).length;
+  return [
+    `سجل الدخول عبر QR (${range.label}): ${logs.length} عملية.`,
+    `المسموح: ${allowed} | التنبيهات: ${logs.length - allowed}.`,
+    listLines(logs.sort((a, b) => new Date(b.scannedAt) - new Date(a.scannedAt)).map(log => `${log.studentName || 'تلميذ غير معروف'} - ${dateTimeText(log.scannedAt)} - ${log.paymentStatus} - ${log.allowed ? 'مسموح' : 'تنبيه'} - ${log.deviceName || 'جهاز غير محدد'}`), 'لا توجد عمليات دخول مطابقة.')
+  ].join('\n');
+}
+
+function buildSubjectAnswer(store, context) {
+  const subject = context.subject;
+  if (!subject) {
+    return `المواد المسجلة: ${store.subjects.length}\n${listLines(store.subjects.map(subject => `${subject.name} - ${subject.notes || 'بدون ملاحظات'}`), 'لا توجد مواد مسجلة.')}`;
+  }
+  const links = store.studentSubjects.filter(link => link.subjectId === subject.id);
+  const students = links.map(link => store.students.find(student => student.id === link.studentId)).filter(Boolean);
+  const teachers = store.teachers.filter(teacher => teacher.subjectIds.includes(subject.id));
+  const schedules = store.teacherSchedules.filter(schedule => schedule.subjectId === subject.id);
+  return [
+    `مادة ${subject.name}:`,
+    `عدد التلاميذ: ${students.length} | عدد الأساتذة: ${teachers.length} | عدد الحصص: ${schedules.length}.`,
+    `التلاميذ:\n${listLines(students.map(studentLine), 'لا يوجد تلاميذ مسجلون في هذه المادة.', 10)}`,
+    `الأساتذة:\n${listLines(teachers.map(teacher => `${teacher.fullName}${teacher.phone ? ` - ${teacher.phone}` : ''}`), 'لا يوجد أساتذة مرتبطون بهذه المادة.', 10)}`
+  ].join('\n');
+}
+
+function buildTeacherAnswer(store, context) {
+  const teacher = context.teacher;
+  if (!teacher) {
+    return `الأساتذة المسجلون: ${store.teachers.length}\n${listLines(store.teachers.map(teacher => `${teacher.fullName} - ${teacher.phone || 'بدون هاتف'} - ${teacher.subjectIds.map(id => store.subjects.find(subject => subject.id === id)?.name).filter(Boolean).join('، ') || 'لا توجد مواد'}`), 'لا يوجد أساتذة مسجلون.')}`;
+  }
+  const subjects = teacher.subjectIds.map(id => store.subjects.find(subject => subject.id === id)?.name).filter(Boolean);
+  const schedules = store.teacherSchedules.filter(schedule => schedule.teacherId === teacher.id).sort((a, b) => `${a.day}${a.startTime}`.localeCompare(`${b.day}${b.startTime}`));
+  return [
+    `الأستاذ/ة ${teacher.fullName}:`,
+    `الهاتف: ${teacher.phone || 'غير محدد'} | المواد: ${subjects.length ? subjects.join('، ') : 'غير محددة'}.`,
+    `السنوات: ${teacher.levels?.length ? teacher.levels.join('، ') : 'غير محددة'} | الأفواج: ${teacher.groups?.length ? teacher.groups.join('، ') : 'غير محددة'}.`,
+    `البرنامج الأسبوعي:\n${listLines(schedules.map(schedule => {
+      const subject = store.subjects.find(item => item.id === schedule.subjectId);
+      return `${schedule.day || 'يوم غير محدد'} ${schedule.startTime || '--:--'}-${schedule.endTime || '--:--'} | ${subject?.name || 'مادة غير محددة'} | ${schedule.level || 'سنة غير محددة'} | ${schedule.group || 'فوج غير محدد'} | ${schedule.room || 'بدون قاعة'}`;
+    }), 'لا توجد حصص مسجلة لهذا الأستاذ.', 12)}`,
+    teacher.notes ? `ملاحظات: ${teacher.notes}` : ''
+  ].filter(Boolean).join('\n');
+}
+
+function buildScheduleAnswer(store, context) {
+  let schedules = [...(store.teacherSchedules || [])];
+  if (context.teacher) schedules = schedules.filter(schedule => schedule.teacherId === context.teacher.id);
+  if (context.subject) schedules = schedules.filter(schedule => schedule.subjectId === context.subject.id);
+  if (context.year.year) schedules = schedules.filter(schedule => schedule.level === context.year.year);
+  if (context.group) schedules = schedules.filter(schedule => schedule.group === context.group);
+
+  return [
+    `الحصص المطابقة للسؤال: ${schedules.length}.`,
+    listLines(schedules.map(schedule => {
+      const subject = store.subjects.find(item => item.id === schedule.subjectId);
+      const teacher = store.teachers.find(item => item.id === schedule.teacherId);
+      return `${schedule.day || 'يوم غير محدد'} ${schedule.startTime || '--:--'}-${schedule.endTime || '--:--'} | ${subject?.name || 'مادة غير محددة'} | ${teacher?.fullName || 'أستاذ غير محدد'} | ${schedule.level || 'سنة غير محددة'} | ${schedule.group || 'فوج غير محدد'} | ${schedule.room || 'بدون قاعة'}`;
+    }), 'لا توجد حصص مطابقة لهذا السؤال.')
+  ].join('\n');
+}
+
+function buildYearDistributionAnswer(store) {
+  const rows = SCHOOL_YEARS.map(year => ({ year, count: store.students.filter(student => student.level === year).length }));
+  const stages = [
+    ['ابتدائي', rows.filter(row => row.year.includes('ابتدائي')).reduce((sum, row) => sum + row.count, 0)],
+    ['متوسط', rows.filter(row => row.year.includes('متوسط')).reduce((sum, row) => sum + row.count, 0)],
+    ['ثانوي', rows.filter(row => row.year.includes('ثانوي')).reduce((sum, row) => sum + row.count, 0)]
+  ];
+  return [
+    `توزيع التلاميذ حسب المراحل:\n${stages.map(([name, count]) => `- ${name}: ${count}`).join('\n')}`,
+    `توزيع السنوات:\n${listLines(rows.map(row => `${row.year}: ${row.count}`), 'لا توجد سنوات مسجلة.', 12)}`
+  ].join('\n');
+}
+
+function buildSettingsAnswer(store) {
+  const settings = store.settings || {};
+  return [
+    `إعدادات الجمعية الحالية:`,
+    `اسم الجمعية: ${settings.associationName || 'غير محدد'}.`,
+    `مدة الاشتراك الافتراضية: ${settings.defaultDurationMonths || 'غير محددة'} شهر.`,
+    `أيام التنبيه قبل الانتهاء: ${settings.soonDays || 'غير محددة'}.`,
+    `الأصوات: ${settings.sounds ? 'مفعلة' : 'غير مفعلة'}.`,
+    `الشعار: ${settings.logo ? 'مرفوع' : 'غير مرفوع'}.`
+  ].join('\n');
+}
+
+function buildAppHelpAnswer(question) {
+  if (includesAny(question, ['اضيف تلميذ', 'إضافة تلميذ', 'اضافة تلميذ'])) return 'لإضافة تلميذ: افتح صفحة "التلاميذ"، اضغط "إضافة تلميذ"، املأ البيانات، اختر السنة والمواد، ثم احفظ. سيتم إنشاء QR تلقائياً وربط التلميذ بقاعدة Firebase.';
+  if (includesAny(question, ['تسجيل دفع', 'دفعة', 'ادفع', 'دفع'])) return 'لتسجيل دفعة: افتح صفحة "المدفوعات"، اختر التلميذ، أدخل المبلغ ومدة الاشتراك، ثم اضغط تسجيل الدفع. سيتم تحديث تاريخ الدفع ونهاية الاشتراك وحذف الكريدي تلقائياً.';
+  if (includesAny(question, ['مسح', 'qr', 'كاميرا'])) return 'لمسح QR: افتح "ماسح QR"، شغل الكاميرا، وضع بطاقة التلميذ داخل الإطار. سيعرض التطبيق حالة الاشتراك ويسجل الدخول في سجل الحضور.';
+  if (includesAny(question, ['استاذ', 'أستاذ', 'برنامج', 'حصة'])) return 'لإدارة الأساتذة والبرامج: أضف الأستاذ من صفحة "الأساتذة"، ثم افتح "برامج الأساتذة" لإضافة الحصص حسب اليوم، الوقت، المادة، السنة، الفوج، والقاعة.';
+  if (includesAny(question, ['مادة', 'مواد'])) return 'لإدارة المواد: افتح صفحة "المواد"، أضف المادة أو عدلها، ثم اربطها بالتلميذ من ملفه أو عند إضافة التلميذ.';
+  return 'يمكنني مساعدتك في استعمال التطبيق أو تحليل بياناته. اسألني عن التلاميذ، الكريديات، المدفوعات، QR، الحضور، المواد، الأساتذة، البرامج، التقارير أو الإعدادات.';
+}
+
+function answerAssistantQuestion(question, store) {
+  const context = makeAssistantContext(question, store);
+  const q = context.q;
 
   if (!q) return 'اكتب سؤالاً عن بيانات الجمعية وسأحلله لك.';
 
-  if ((q.includes('كم') || q.includes('عدد')) && hasStudentWord(q) && !subject && !requestedYear) {
-    return `عدد التلاميذ المسجلين حالياً هو: ${students.length}.`;
-  }
+  if (context.wantsHelp) return buildAppHelpAnswer(question);
+  if (context.student) return formatStudentDetails(context.student, store);
+  if (includesAny(q, ['كريدي', 'دين', 'ديون', 'مستحقات', 'غير مدفوع', 'لم يدفع'])) return buildCreditAnswer(store, context);
+  if (includesAny(q, ['مدفوعات', 'دفعات', 'دفع', 'مداخيل', 'دخل', 'مبلغ']) && !includesAny(q, ['دخول', 'الحضور'])) return buildPaymentAnswer(store, context);
+  if (includesAny(q, ['حضور', 'دخول', 'مسح', 'ماسح', 'qr', 'بطاقة'])) return buildAttendanceAnswer(store, context);
+  if (includesAny(q, ['برنامج', 'حصة', 'حصص', 'جدول', 'توقيت'])) return context.teacher ? buildTeacherAnswer(store, context) : buildScheduleAnswer(store, context);
+  if (includesAny(q, ['استاذ', 'أستاذ', 'اساتذه', 'أساتذة', 'معلم'])) return buildTeacherAnswer(store, context);
+  if (includesAny(q, ['مادة', 'مواد', 'يدرس', 'تدرس']) || context.subject) return buildSubjectAnswer(store, context);
+  if (includesAny(q, ['سنوات', 'سنة', 'مستوى', 'مرحلة', 'توزيع']) || context.year.year || context.year.stage || context.group || context.paymentFilter || hasStudentWord(q)) return buildStudentsAnswer(store, context);
+  if (includesAny(q, ['اعدادات', 'إعدادات', 'الجمعية', 'الشعار', 'اصوات', 'أصوات'])) return buildSettingsAnswer(store);
+  if (context.wantsSummary || includesAny(q, ['تقارير', 'تقرير', 'احصاء', 'احصائيات', 'إحصائيات', 'ملخص', 'وضع'])) return buildAssistantInsights(store);
 
-  if ((q.includes('كريدي') || q.includes('لم يدفع') || q.includes('غير مدفوع')) && hasAmountWord(q)) {
-    return `إجمالي مبالغ الكريديات الحالية هو ${money(totalCredit)}، وعدد التلاميذ المعنيين هو ${creditStudents.length}.`;
-  }
-
-  if (q.includes('كريدي') || q.includes('لم يدفع') || q.includes('غير مدفوع')) {
-    return `التلاميذ الموجودون في الكريديات أو غير المدفوعين:\n${listLines(creditStudents.map(studentLine), 'لا يوجد تلاميذ في الكريديات حالياً.')}\n\nالإجمالي: ${money(totalCredit)}.`;
-  }
-
-  if (q.includes('تنتهي') || q.includes('قريبا') || q.includes('قريب')) {
-    return `الاشتراكات التي ستنتهي قريباً:\n${listLines(soonStudents.map(student => `${studentLine(student)} - تاريخ الانتهاء: ${dateText(student.expiryDate)}`), 'لا توجد اشتراكات تنتهي قريباً حالياً.')}`;
-  }
-
-  if ((q.includes('دخل') || q.includes('حضور') || q.includes('qr')) && q.includes('اليوم')) {
-    return `عمليات الدخول اليوم عبر QR: ${todayLogs.length}\n${listLines(todayLogs.map(log => `${log.studentName} - ${dateTimeText(log.scannedAt)} - ${log.paymentStatus}`), 'لا توجد عمليات دخول مسجلة اليوم.')}`;
-  }
-
-  if (requestedYear && (q.includes('قائمه') || q.includes('قائمة') || q.includes('تلاميذ') || q.includes('السنه') || q.includes('السنة'))) {
-    const yearStudents = students.filter(item => item.level === requestedYear);
-    return `تلاميذ ${requestedYear}: ${yearStudents.length}\n${listLines(yearStudents.map(studentLine), 'لا يوجد تلاميذ في هذه السنة حالياً.')}`;
-  }
-
-  if (subject) {
-    const subjectRows = store.studentSubjects.filter(link => link.subjectId === subject.id);
-    const subjectStudents = subjectRows.map(link => students.find(student => student.id === link.studentId)).filter(Boolean);
-    const subjectTeachers = teachers.filter(item => item.subjectIds.includes(subject.id));
-    if (q.includes('عدد')) {
-      return `عدد التلاميذ المسجلين في ${subject.name}: ${subjectStudents.length}.\nالأساتذة المرتبطون بالمادة: ${subjectTeachers.length ? subjectTeachers.map(t => t.fullName).join('، ') : 'لا يوجد أساتذة بعد.'}`;
-    }
-    return `مادة ${subject.name}:\nالتلاميذ:\n${listLines(subjectStudents.map(studentLine), 'لا يوجد تلاميذ مسجلون في هذه المادة.')}\n\nالأساتذة:\n${listLines(subjectTeachers.map(item => `${item.fullName}${item.phone ? ` - ${item.phone}` : ''}`), 'لا يوجد أساتذة مرتبطون بهذه المادة.')}`;
-  }
-
-  if (teacher && q.includes('برنامج')) {
-    const teacherSchedules = schedules.filter(schedule => schedule.teacherId === teacher.id);
-    return `برنامج الأستاذ/ة ${teacher.fullName}:\n${listLines(teacherSchedules.map(schedule => {
-      const scheduleSubject = subjects.find(item => item.id === schedule.subjectId);
-      return `${schedule.day || 'يوم غير محدد'} ${schedule.startTime || '--:--'}-${schedule.endTime || '--:--'} | ${scheduleSubject?.name || 'مادة غير محددة'} | ${schedule.level || 'سنة غير محددة'} | ${schedule.group || 'فوج غير محدد'} | ${schedule.room || 'بدون قاعة'}`;
-    }), 'لا توجد حصص مسجلة لهذا الأستاذ حالياً.')}`;
-  }
-
-  if (teacher) {
-    const teacherSubjects = teacher.subjectIds.map(id => subjects.find(subject => subject.id === id)?.name).filter(Boolean);
-    const teacherSchedules = schedules.filter(schedule => schedule.teacherId === teacher.id);
-    return `الأستاذ/ة ${teacher.fullName}:\nالهاتف: ${teacher.phone || 'غير محدد'}\nالمواد: ${teacherSubjects.length ? teacherSubjects.join('، ') : 'غير محددة'}\nعدد الحصص الأسبوعية: ${teacherSchedules.length}\nالأفواج: ${teacher.groups.length ? teacher.groups.join('، ') : 'غير محددة'}`;
-  }
-
-  if (student) {
-    const rows = getStudentAcademicRows(student.id, store);
-    if (q.includes('مدفوع') || q.includes('الدفع') || q.includes('الحاله') || q.includes('الحالة')) {
-      return `حالة التلميذ ${student.fullName}: ${isCreditStudent(student) ? CREDIT : student.paymentStatus}.\nآخر دفع: ${dateText(student.lastPaymentDate)}\nانتهاء الاشتراك: ${dateText(student.expiryDate)}\nالكريدي: ${money(student.creditAmount || 0)}.`;
-    }
-    if (q.includes('ينتهي') || q.includes('نهايه') || q.includes('نهاية') || q.includes('اشتراك')) {
-      return `اشتراك ${student.fullName} ينتهي في: ${dateText(student.expiryDate)}.\nالحالة الحالية: ${isCreditStudent(student) ? CREDIT : student.paymentStatus}.`;
-    }
-    if (q.includes('مواد') || q.includes('يدرس')) {
-      return `مواد التلميذ ${student.fullName}:\n${listLines(rows.map(row => `${row.subject?.name || 'مادة غير محددة'} مع ${row.teacher?.fullName || 'أستاذ غير محدد'} - ${timeRange(row.schedule)}`), 'لا توجد مواد مسجلة لهذا التلميذ.')}`;
-    }
-    return `ملخص ${student.fullName}:\nالسنة: ${student.level || 'غير محددة'}\nالفوج: ${student.group || 'غير محدد'}\nحالة الدفع: ${isCreditStudent(student) ? CREDIT : student.paymentStatus}\nالمواد: ${rows.length ? rows.map(row => row.subject?.name).filter(Boolean).join('، ') : 'لا توجد مواد'}\nتاريخ التسجيل: ${dateText(student.registrationDate)}`;
-  }
-
-  if (q.includes('اقتراح') || q.includes('ملاحظات') || q.includes('ملخص') || q.includes('احصائيات') || q.includes('إحصائيات')) {
-    return buildAssistantInsights(store);
-  }
-
-  return `لم أجد سؤالاً محدداً بما يكفي، لكن هذا ملخص سريع:\n${buildAssistantInsights(store)}\n\nيمكنك أن تسأل مثلاً: "من لم يدفع؟"، "ما برنامج الأستاذ أحمد؟"، "كم عدد تلاميذ الفرنسية؟"، أو "ما مواد التلميذ محمد؟".`;
+  return [
+    'أفهم سؤالك كطلب عام عن بيانات التطبيق. هذا ملخص حي من قاعدة البيانات:',
+    buildAssistantInsights(store),
+    '',
+    'أستطيع أيضاً تفصيل أي جزء: اكتب اسم تلميذ، أستاذ، مادة، سنة، فوج، أو اسأل عن الكريديات، المدفوعات، الحضور، QR، البرامج، التقارير أو الإعدادات.'
+  ].join('\n');
 }
 
 function buildAssistantInsights(store) {
@@ -491,13 +755,20 @@ function buildAssistantInsights(store) {
   const topYear = yearCounts[0];
   const teacherLoads = store.teachers.map(teacher => ({ teacher, count: store.teacherSchedules.filter(schedule => schedule.teacherId === teacher.id).length })).sort((a, b) => b.count - a.count);
   const topTeacher = teacherLoads[0];
+  const paidStudents = students.filter(student => student.paymentStatus === PAID).length;
+  const expiredStudents = students.filter(student => student.paymentStatus === EXPIRED).length;
+  const totalPayments = store.payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+  const todayLogs = store.attendanceLogs.filter(log => log.scannedAt?.slice(0, 10) === todayISO());
   return [
     `عدد التلاميذ المسجلين: ${students.length}.`,
+    `الدافعون: ${paidStudents} | المنتهية اشتراكاتهم: ${expiredStudents} | سينتهي قريباً: ${soonStudents.length}.`,
     `عدد التلاميذ في الكريديات: ${creditStudents.length}.`,
     `مجموع الكريديات الحالية: ${money(totalCredit)}.`,
-    `الاشتراكات التي تنتهي قريباً: ${soonStudents.length}.`,
+    `إجمالي المداخيل المسجلة: ${money(totalPayments)}.`,
+    `عمليات الدخول اليوم عبر QR: ${todayLogs.length}.`,
     `أكثر سنة تسجيلاً: ${topYear && topYear.count > 0 ? `${topYear.year} (${topYear.count})` : 'لا توجد بيانات كافية بعد'}.`,
-    `أكثر أستاذ لديه حصص: ${topTeacher && topTeacher.count > 0 ? `${topTeacher.teacher.fullName} (${topTeacher.count})` : 'لا توجد برامج أساتذة بعد'}.`
+    `أكثر أستاذ لديه حصص: ${topTeacher && topTeacher.count > 0 ? `${topTeacher.teacher.fullName} (${topTeacher.count})` : 'لا توجد برامج أساتذة بعد'}.`,
+    `المواد: ${store.subjects.length} | الأساتذة: ${store.teachers.length} | الحصص الأسبوعية: ${store.teacherSchedules.length}.`
   ].join('\n');
 }
 
@@ -555,7 +826,7 @@ function App() {
       email: user.email || '',
       name: user.displayName || user.email || '',
       lastLoginAt: serverTimestamp()
-    }, { merge: true }).catch((error) => setFirebaseError(error.message));
+    }, { merge: true }).catch(() => {});
   }, [user]);
 
   useEffect(() => {
@@ -564,7 +835,7 @@ function App() {
     setFirebaseError('');
     let nextStore = normalizeStore(emptyStore);
     const loaded = new Set();
-    const collections = [...FIRESTORE_COLLECTIONS, 'credits'];
+    const collections = FIRESTORE_COLLECTIONS;
     const requiredSnapshots = collections.length + 1;
     const markLoaded = (key) => {
       loaded.add(key);
@@ -700,6 +971,62 @@ const navItems = [
   { id: 'settings', label: 'الإعدادات', icon: Settings }
 ];
 
+function isStandaloneApp() {
+  return window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+function useInstallPrompt() {
+  const [installPrompt, setInstallPrompt] = useState(window.jam3iyaInstallPrompt || null);
+  const [installed, setInstalled] = useState(isStandaloneApp());
+
+  useEffect(() => {
+    const handleBeforeInstall = (event) => {
+      event.preventDefault();
+      window.jam3iyaInstallPrompt = event;
+      setInstallPrompt(event);
+      setInstalled(false);
+    };
+    const handleInstalled = () => {
+      window.jam3iyaInstallPrompt = null;
+      setInstallPrompt(null);
+      setInstalled(true);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
+
+  const install = async () => {
+    const prompt = installPrompt || window.jam3iyaInstallPrompt;
+    if (prompt) {
+      prompt.prompt();
+      await prompt.userChoice;
+      window.jam3iyaInstallPrompt = null;
+      setInstallPrompt(null);
+      setInstalled(isStandaloneApp());
+      return;
+    }
+
+    alert('إذا لم تظهر نافذة التثبيت، افتح قائمة المتصفح واختر "تثبيت التطبيق" أو "إضافة إلى الشاشة الرئيسية".');
+  };
+
+  return { install, installed };
+}
+
+function InstallAppButton({ compact = false }) {
+  const { install, installed } = useInstallPrompt();
+  return (
+    <button type="button" className={`installButton ${compact ? 'compact' : ''} ${installed ? 'installed' : ''}`} onClick={install}>
+      <Download size={18} />
+      {installed ? 'مثبت' : 'تحميل التطبيق'}
+    </button>
+  );
+}
+
 function Login({ onLogin }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -727,6 +1054,7 @@ function Login({ onLogin }) {
         <label>كلمة المرور<input type="password" value={password} onChange={e => setPassword(e.target.value)} required autoComplete="current-password" /></label>
         {error && <div className="errorLine">{error}</div>}
         <button className="primaryBtn" disabled={loading}><LogIn size={18} /> {loading ? 'جار الدخول...' : 'دخول'}</button>
+        <InstallAppButton />
       </form>
     </div>
   );
@@ -756,6 +1084,7 @@ function Topbar({ title, settings, user }) {
     <header className="topbar">
       <div><h2>{title}</h2><p>{settings.associationName}</p></div>
       <div className="topbarActions">
+        <InstallAppButton compact />
         <button className="iconButton" title="الإشعارات"><Bell size={18} /></button>
         <div className="adminChip"><div className="adminAvatar">{displayName.slice(0, 1)}</div><span>{displayName}</span></div>
         <button className="iconButton menuButton" title="القائمة"><LayoutDashboard size={18} /></button>
@@ -1502,12 +1831,12 @@ function SmartAssistantPage({ store }) {
   const [thinking, setThinking] = useState(false);
   const chatEndRef = useRef(null);
   const quickQuestions = [
-    'كم عدد التلاميذ المسجلين؟',
-    'من هم التلاميذ الذين لم يدفعوا؟',
-    'كم مجموع مبالغ الكريديات؟',
-    'من تنتهي اشتراكاتهم قريباً؟',
-    'من دخل اليوم عبر بطاقة QR؟',
-    'أعطني ملخصاً ذكياً عن الجمعية.'
+    'أعطني تقريراً شاملاً عن الجمعية.',
+    'حلل لي وضع التلاميذ والمدفوعات والكريديات.',
+    'ما توزيع التلاميذ حسب السنوات والمراحل؟',
+    'اعرض الحضور والدخول عبر QR هذا الشهر.',
+    'ما برامج الأساتذة والحصص المسجلة؟',
+    'كيف أستعمل التطبيق لإضافة تلميذ وتسجيل دفع؟'
   ];
 
   useEffect(() => {
@@ -1669,4 +1998,12 @@ function StudentMini({ student }) {
   return <div className="studentMini">{student.photo ? <img src={student.photo} alt="" /> : <div className="avatar">{student.fullName?.slice(0, 1) || '؟'}</div>}<div><strong>{student.fullName || 'بدون اسم'}</strong><small>{student.registrationNumber || 'بدون رقم تسجيل'}</small></div></div>;
 }
 
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+  });
+}
+
+registerServiceWorker();
 createRoot(document.getElementById('root')).render(<App />);

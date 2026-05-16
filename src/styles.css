@@ -214,6 +214,10 @@ th { color: var(--muted); font-weight: 700; background: #f7fafd; }
 .iconButton { width: 42px; min-width: 42px; padding: 0; border-radius: 14px; background: #F5F8FC; border: 1px solid var(--line); }
 .adminChip { display: flex; align-items: center; gap: 10px; background: #fff; border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; color: var(--ink); font-weight: 700; }
 .adminAvatar { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; color: #fff; background: linear-gradient(135deg, #0B63E5, #16A3A3); }
+.installButton { background: linear-gradient(135deg, #0B63E5, #1E7BFF); color: #fff; border-radius: 14px; box-shadow: 0 10px 22px rgba(11, 99, 229, .18); white-space: nowrap; }
+.installButton.compact { min-height: 42px; padding: 0 12px; }
+.installButton.installed { background: #E7F8EF; color: var(--green); box-shadow: none; }
+.loginBox .installButton { width: 100%; background: #EAF3FF; color: var(--blue); box-shadow: none; border: 1px solid #CFE4FF; }
 
 .panel, .widePanel, .scanResult, .idCard, .statCard { border: 0; border-radius: 18px; box-shadow: var(--shadow); }
 .primaryBtn { background: linear-gradient(135deg, #0B63E5, #1E7BFF); border-radius: 12px; box-shadow: 0 10px 22px rgba(11, 99, 229, .18); }
@@ -320,6 +324,8 @@ td:last-child { border-radius: 14px 0 0 14px; border-left: 1px solid var(--line)
   .logoutBtn { display: none !important; }
   .mainPanel { padding: 16px; }
   .topbar, .panelHeader { align-items: stretch; flex-direction: column; }
+  .topbarActions { flex-wrap: wrap; justify-content: flex-start; }
+  .installButton.compact { flex: 1 1 150px; }
   .statsGrid, .formGrid, .twoCols, .qrPage, .scannerGrid, .logsLayout, .creditSummary, .profileGrid, .teacherLayout, .assistantGrid, .dashboardStats, .dashboardCharts, .settingsLayout { grid-template-columns: 1fr; }
   .idCard { width: 100%; }
   .toolbar > select, .toolbar > button { width: 100%; }

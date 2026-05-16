@@ -1,0 +1,36 @@
+{
+  "name": "تطبيق إدارة جمعية الدعم الدراسي",
+  "short_name": "جمعية الدعم",
+  "description": "إدارة التلاميذ، المدفوعات، الكريديات، QR، الأساتذة، والتقارير.",
+  "lang": "ar-DZ",
+  "dir": "rtl",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#0B63E5",
+  "background_color": "#F5F8FC",
+  "icons": [
+    {
+      "src": "/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["education", "productivity", "business"],
+  "shortcuts": [
+    {
+      "name": "التلاميذ",
+      "short_name": "التلاميذ",
+      "url": "/?page=students",
+      "icons": [{ "src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+    },
+    {
+      "name": "ماسح QR",
+      "short_name": "QR",
+      "url": "/?page=scanner",
+      "icons": [{ "src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+    }
+  ]
+}
