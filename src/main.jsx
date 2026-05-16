@@ -45,7 +45,7 @@ const UNPAID = 'غير مدفوع';
 const EXPIRED = 'منتهي الصلاحية';
 const SOON = 'سينتهي قريباً';
 const CREDIT = 'كريدي';
-const AI_ASSISTANT_NAME = 'deepseek/deepseek-v4-flash:free';
+const AI_ASSISTANT_NAME = 'DeepSeek AI';
 const AI_WELCOME_MESSAGE = `مرحباً، أنا ${AI_ASSISTANT_NAME}، كيف يمكنني مساعدتك في إدارة الجمعية اليوم؟`;
 
 const SCHOOL_YEARS = [
@@ -720,7 +720,7 @@ function buildAppHelpAnswer(question) {
   return 'يمكنني مساعدتك في استعمال التطبيق أو تحليل بياناته. اسألني عن التلاميذ، الكريديات، المدفوعات، QR، الحضور، المواد، الأساتذة، البرامج، التقارير أو الإعدادات.';
 }
 
-function answerAssistantQuestion(question, store) {
+function getLocalAnswer(question, store) {
   const context = makeAssistantContext(question, store);
   const q = context.q;
 
@@ -739,11 +739,55 @@ function answerAssistantQuestion(question, store) {
   if (context.wantsSummary || includesAny(q, ['تقارير', 'تقرير', 'احصاء', 'احصائيات', 'إحصائيات', 'ملخص', 'وضع'])) return buildAssistantInsights(store);
 
   return [
-    'أفهم سؤالك كطلب عام عن بيانات التطبيق. هذا ملخص حي من قاعدة البيانات:',
-    buildAssistantInsights(store),
-    '',
-    'أستطيع أيضاً تفصيل أي جزء: اكتب اسم تلميذ، أستاذ، مادة، سنة، فوج، أو اسأل عن الكريديات، المدفوعات، الحضور، QR، البرامج، التقارير أو الإعدادات.'
+    'هذا ملخص لبيانات التطبيق:',
+    buildAssistantInsights(store)
   ].join('\n');
+}
+
+async function answerAssistantQuestion(question, store) {
+  const localData = getLocalAnswer(question, store);
+  
+  const systemPrompt = `أنت مساعد ذكي لإدارة جمعية (نظام مدرسي/تعليمي). 
+قام النظام بسحب البيانات التالية من قاعدة البيانات المحلية كإجابة مبدئية على سؤال المستخدم:
+"""
+${localData}
+"""
+
+مهمتك:
+1. الإجابة على سؤال المستخدم بدقة بالاعتماد كلياً على البيانات المسحوبة أعلاه.
+2. إذا كانت البيانات تحتوي على قوائم أو أرقام، قم بتنسيقها بشكل جميل وودي واحترافي.
+3. إذا كان سؤال المستخدم خارج نطاق الجمعية، يمكنك الإجابة عليه بشكل طبيعي ولكن ذكره بأنك مخصص لبيانات الجمعية.
+4. الإجابة يجب أن تكون باللغة العربية حصراً.`;
+
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${import.meta.env.VITE_OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'deepseek/deepseek-v4-flash:free',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: question }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('API Request failed');
+    }
+
+    const data = await response.json();
+    let answer = data.choices[0].message.content;
+    // Remove <think> tags if r1 produces them
+    answer = answer.replace(/<think>[\s\S]*?<\/think>\n?/g, '').trim();
+    return answer;
+  } catch (error) {
+    console.error('AI Error:', error);
+    return "عذراً، حدث خطأ في الاتصال بالذكاء الاصطناعي. إليك البيانات المباشرة:\n\n" + localData;
+  }
 }
 
 function buildAssistantInsights(store) {
@@ -1843,17 +1887,21 @@ function SmartAssistantPage({ store }) {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages, thinking]);
 
-  const ask = (text) => {
+  const ask = async (text) => {
     const question = text.trim();
     if (!question || thinking) return;
     setMessages(prev => [...prev, { role: 'user', text: question }]);
     setInput('');
     setThinking(true);
-    window.setTimeout(() => {
-      const answer = answerAssistantQuestion(question, store);
+    
+    try {
+      const answer = await answerAssistantQuestion(question, store);
       setMessages(prev => [...prev, { role: 'assistant', text: answer }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', text: 'حدث خطأ غير متوقع.' }]);
+    } finally {
       setThinking(false);
-    }, 450);
+    }
   };
 
   const submit = (e) => {
